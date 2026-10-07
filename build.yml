@@ -1,0 +1,122 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - preRelease
+      - prototype
+  pull_request:
+    branches:
+      - prototype
+
+# The build provisions a Windows VM with a fixed IP on the Proxmox node.
+# Parallel runs (push + pull_request of the same or different refs) would
+# collide on that VM/IP, so all runs share one concurrency group and are
+# queued instead of cancelled.
+concurrency:
+  group: gorhythm-build-vm
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+
+      - name: Setup SSH Key
+        id: ssh_key
+        run: |
+          mkdir -p /secrets
+          SSH_KEY_PATH=$(mktemp /secrets/vm_ssh_key.XXXXXX)
+          echo "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+          ssh-keygen -y -f "$SSH_KEY_PATH"
+          echo "ssh_key_path=$SSH_KEY_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            ci
+          sparse-checkout-cone-mode: true
+
+      - name: Clone & Start Windows VM
+        id: provision_vm
+        run: |
+          chmod +x ./ci/provision-vm.sh
+          ./ci/provision-vm.sh
+        env:
+          PROXMOX_HOST:     ${{ secrets.PROXMOX_HOST }}
+          PROXMOX_USER:     ${{ secrets.PROXMOX_USER }}
+          PROXMOX_PASSWORD: ${{ secrets.PROXMOX_PASSWORD }}
+          PROXMOX_NODE:     ${{ secrets.PROXMOX_NODE }}
+          TEMPLATE_VMID:    ${{ vars.TEMPLATE_VMID }}
+          VM_FIXED_IP:      ${{ vars.VM_FIXED_IP }}
+          VM_USER:          ${{ vars.VM_USER }}
+          VM_SSH_KEY_PATH:  ${{ steps.ssh_key.outputs.ssh_key_path }}
+
+      - name: Transfer Source & Run Nuke Build
+        run: |
+          chmod +x ./ci/run-build.sh
+          ./ci/run-build.sh
+        env:
+          VM_IP:       ${{ env.VM_IP }}
+          NEW_VMID:    ${{ env.NEW_VMID }}
+          VM_USER:     ${{ vars.VM_USER }}
+          VM_SSH_KEY_PATH: ${{ steps.ssh_key.outputs.ssh_key_path }}
+          REPOSITORY_TOKEN: ${{ secrets.REPOSITORY_TOKEN }}
+          REPOSITORY_HOST: ${{ secrets.REPOSITORY_HOST }}
+          GIT_BRANCH:     ${{ forgejo.ref_name }}
+          GIT_REF:        ${{ forgejo.ref }}
+          TARGET:       delivery
+
+      - name: Read Version
+        id: read_version
+        run: |
+          VERSION=$(tr -d '\r\n' < ./artifacts/_version_.txt)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Read Publish Path
+        id: read_publish_path
+        run: |
+          PUBLISH_PATH=$(tr -d '\r\n' < ./artifacts/_publish_.txt)
+          PUBLISH_PATH="${PUBLISH_PATH//\\//}"
+          echo "publish_path=$PUBLISH_PATH" >> $GITHUB_OUTPUT
+
+      - name: Collect Artifacts
+        run: |
+          chmod +x ./ci/collect-artifacts.sh
+          ./ci/collect-artifacts.sh
+        env:
+          VM_IP:       ${{ env.VM_IP }}
+          VM_USER:     ${{ vars.VM_USER }}
+          VM_SSH_KEY_PATH: ${{ steps.ssh_key.outputs.ssh_key_path }}
+          PUBLISH_PATH: ${{ steps.read_publish_path.outputs.publish_path }}
+
+      - name: Upload Artifacts
+        # upload-artifact@v4 requires the GHES artifact API v2, which the
+        # Forgejo backend does not support -> use v3 with a single zip file
+        # created by ci/collect-artifacts.sh.
+        uses: https://data.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: GoRhythmCPS_${{ steps.read_version.outputs.version }}
+          path: GoRhythmCPS_${{ steps.read_version.outputs.version }}.zip
+          retention-days: 3
+
+      - name: Destroy VM
+        if: always()
+        run: |
+          chmod +x ./ci/destroy-vm.sh
+          ./ci/destroy-vm.sh
+        env:
+          PROXMOX_HOST:     ${{ secrets.PROXMOX_HOST }}
+          PROXMOX_NODE:     ${{ secrets.PROXMOX_NODE }}
+          PROXMOX_TOKEN_ID: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PROXMOX_TOKEN:    ${{ secrets.PROXMOX_TOKEN }}
+          NEW_VMID:         ${{ env.NEW_VMID }}
+
+      - name: Cleanup SSH Key
+        if: always()
+        run: rm -f "${{ steps.ssh_key.outputs.ssh_key_path }}"
